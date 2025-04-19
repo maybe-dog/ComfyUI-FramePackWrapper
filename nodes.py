@@ -263,6 +263,43 @@ class FramePackFindNearestBucket:
         return (new_width, new_height, )
 
 
+class CreateKeyframes:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latents_a": ("LATENT",),
+                "repeat_a": ("INT", {"default": 1, "min": 1}),
+            },
+            "optional": {
+                "latents_b": ("LATENT",),
+                "repeat_b": ("INT", {"default": 1, "min": 1}),
+                "latents_c": ("LATENT",),
+                "repeat_c": ("INT", {"default": 1, "min": 1}),
+            }
+        }
+    CATEGORY = "FramePackWrapper"
+    DESCRIPTION = "Create keyframes latents by repeating and concatenating a/b/c. Only set latents are used."
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("keyframes",)
+    FUNCTION = "create_keyframes"
+
+    def create_keyframes(self, latents_a, repeat_a, latents_b=None, repeat_b=1, latents_c=None, repeat_c=1):
+        tensors = [latents_a["samples"].repeat(1, 1, repeat_a, 1, 1)]
+        print(f"latents_a shape: {tensors[-1].shape}")
+        if latents_b is not None:
+            b = latents_b["samples"].repeat(1, 1, repeat_b, 1, 1)
+            print(f"latents_b shape: {b.shape}")
+            tensors.append(b)
+        if latents_c is not None:
+            c = latents_c["samples"].repeat(1, 1, repeat_c, 1, 1)
+            print(f"latents_c shape: {c.shape}")
+            tensors.append(c)
+        for i, t in enumerate(tensors):
+            print(f"tensors[{i}] shape: {t.shape}")
+        keyframes = torch.cat(tensors, dim=2) if len(tensors) > 1 else tensors[0]
+        return ({"samples": keyframes},)
+
 class FramePackSampler:
     @classmethod
     def INPUT_TYPES(s):
@@ -290,6 +327,7 @@ class FramePackSampler:
             "optional": {
                 "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
                 "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
+                "keyframes": ("LATENT", {"tooltip": "init Lantents to use for image2video keyframes"} ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             }
         }
@@ -300,7 +338,7 @@ class FramePackSampler:
     CATEGORY = "FramePackWrapper"
 
     def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg, 
-                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, initial_samples=None, denoise_strength=1.0):
+                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, initial_samples=None, keyframes=None, denoise_strength=1.0):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -318,6 +356,8 @@ class FramePackSampler:
         start_latent = start_latent["samples"] * vae_scaling_factor
         if initial_samples is not None:
             initial_samples = initial_samples["samples"] * vae_scaling_factor
+        if keyframes is not None:
+            keyframes = keyframes["samples"] * vae_scaling_factor
         print("start_latent", start_latent.shape)
         B, C, T, H, W = start_latent.shape
 
@@ -369,9 +409,9 @@ class FramePackSampler:
             # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
             latent_paddings_list = latent_paddings.copy()
-            
-        for latent_padding in latent_paddings:
+        for section_no, latent_padding in enumerate(latent_paddings):
             print(f"latent_padding: {latent_padding}")
+            print(f"secton no: {section_no}")
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
 
@@ -381,7 +421,11 @@ class FramePackSampler:
             clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
-            clean_latents_pre = start_latent.to(history_latents)
+            # clean_latents_pre を keyframes からセクションごとに取得。なければ start_latent
+            if keyframes is not None and keyframes.shape[2] > section_no:
+                clean_latents_pre = keyframes[:, :, section_no:section_no+1, :, :].to(history_latents)
+            else:
+                clean_latents_pre = start_latent.to(history_latents)
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
@@ -468,6 +512,7 @@ class FramePackSampler:
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
     "FramePackSampler": FramePackSampler,
+    "CreateKeyframes": CreateKeyframes,
     "FramePackTorchCompileSettings": FramePackTorchCompileSettings,
     "FramePackFindNearestBucket": FramePackFindNearestBucket,
     "LoadFramePackModel": LoadFramePackModel,
@@ -475,6 +520,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadFramePackModel": "(Down)Load FramePackModel",
     "FramePackSampler": "FramePackSampler",
+    "CreateKeyframes": "Create Keyframes",
     "FramePackTorchCompileSettings": "Torch Compile Settings",
     "FramePackFindNearestBucket": "Find Nearest Bucket",
     "LoadFramePackModel": "Load FramePackModel",
