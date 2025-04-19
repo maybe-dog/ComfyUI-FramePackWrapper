@@ -1,7 +1,18 @@
-**Notice: This is a fork by nirvash. This repository is a test version with added keyframe support, based on original ComfyUI-FramePackWrapper.  
+**Notice: This is a fork by nirvash. This repository is a test version for keyframe support, based on original ComfyUI-FramePackWrapper.  
 Original repository (kijai): https://github.com/kijai/ComfyUI-FramePackWrapper**
 
 ![screenshot](images/screenshot-01.png)
+
+## Start - End test
+https://github.com/user-attachments/assets/d4af1e9b-904f-41aa-8a00-4306ed4ff4b0
+
+## Keyframe test
+https://github.com/user-attachments/assets/23e777e5-dd49-444f-bccf-69b4d00625a2
+
+## Feature
+ - Set end frame
+ - Assign weighted keyframes
+ - Use different prompts per section
 
 # ComfyUI Wrapper for [FramePack by lllyasviel](https://lllyasviel.github.io/frame_pack_gitpage/)
 
