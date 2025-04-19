@@ -268,38 +268,40 @@ class CreateKeyframes:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "latents_a": ("LATENT",),
-                "repeat_a": ("INT", {"default": 1, "min": 1}),
+                "latent_a": ("LATENT",),
+                "index_a": ("INT", {"tooltip": "section index for latent_a"}),
             },
             "optional": {
-                "latents_b": ("LATENT",),
-                "repeat_b": ("INT", {"default": 1, "min": 1}),
-                "latents_c": ("LATENT",),
-                "repeat_c": ("INT", {"default": 1, "min": 1}),
+                "latent_b": ("LATENT",),
+                "index_b": ("INT", {"tooltip": "section index for latent_b"}),
+                "latent_c": ("LATENT",),
+                "index_c": ("INT", {"tooltip": "section index for latent_c"}),
+                "prev_keyframes": ("LATENT",),
+                "prev_keyframe_indices": ("LIST", {}),
             }
         }
-    CATEGORY = "FramePackWrapper"
-    DESCRIPTION = "Create keyframes latents by repeating and concatenating a/b/c. Only set latents are used."
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("keyframes",)
+    RETURN_TYPES = ("LATENT", "LIST")
+    RETURN_NAMES = ("keyframes", "keyframe_indices")
     FUNCTION = "create_keyframes"
+    CATEGORY = "FramePackWrapper"
+    DESCRIPTION = "Create keyframes latents and section indices. index_*: section index for each latent. Can be cascaded."
 
-    def create_keyframes(self, latents_a, repeat_a, latents_b=None, repeat_b=1, latents_c=None, repeat_c=1):
-        tensors = [latents_a["samples"].repeat(1, 1, repeat_a, 1, 1)]
-        print(f"latents_a shape: {tensors[-1].shape}")
-        if latents_b is not None:
-            b = latents_b["samples"].repeat(1, 1, repeat_b, 1, 1)
-            print(f"latents_b shape: {b.shape}")
-            tensors.append(b)
-        if latents_c is not None:
-            c = latents_c["samples"].repeat(1, 1, repeat_c, 1, 1)
-            print(f"latents_c shape: {c.shape}")
-            tensors.append(c)
-        for i, t in enumerate(tensors):
-            print(f"tensors[{i}] shape: {t.shape}")
+    def create_keyframes(self, latent_a, index_a, latent_b=None, index_b=None, latent_c=None, index_c=None, prev_keyframes=None, prev_keyframe_indices=None):
+        tensors = [latent_a["samples"]]
+        indices = [index_a]
+        if latent_b is not None and index_b is not None:
+            tensors.append(latent_b["samples"])
+            indices.append(index_b)
+        if latent_c is not None and index_c is not None:
+            tensors.append(latent_c["samples"])
+            indices.append(index_c)
+        if prev_keyframes is not None and prev_keyframe_indices is not None:
+            tensors = [prev_keyframes["samples"]] + tensors
+            indices = list(prev_keyframe_indices) + indices
         keyframes = torch.cat(tensors, dim=2) if len(tensors) > 1 else tensors[0]
         print(f"keyframes shape: {keyframes.shape}")
-        return ({"samples": keyframes},)
+        print(f"keyframe_indices: {indices}")
+        return ({"samples": keyframes}, indices)
 
 class FramePackSampler:
     @classmethod
@@ -324,12 +326,16 @@ class FramePackSampler:
                     {
                         "default": 'unipc_bh1'
                     }),
+                "initial_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "キーフレームから最も遠いときの重み"}),
+                "final_weight": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "キーフレームに最も近いときの重み"}),
+                "weight_power": ("FLOAT", {"default": 1.5, "min": 0.1, "max": 5.0, "step": 0.01, "tooltip": "重みの増加カーブ（指数）"}),
             },
             "optional": {
                 "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
-                "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
-                "keyframes": ("LATENT", {"tooltip": "init Lantents to use for image2video keyframes"} ),
                 "end_latent": ("LATENT", {"tooltip": "end Latents to use for last frame"} ),
+                "keyframes": ("LATENT", {"tooltip": "init Lantents to use for image2video keyframes"} ),
+                "keyframe_indices": ("LIST", {"tooltip": "section index for each keyframe (e.g. [0, 3, 5])"}),
+                "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             }
         }
@@ -340,7 +346,8 @@ class FramePackSampler:
     CATEGORY = "FramePackWrapper"
 
     def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg, 
-                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, initial_samples=None, keyframes=None, end_latent=None, denoise_strength=1.0):
+                guidance_scale, seed, sampler, gpu_memory_preservation, initial_weight=1.0, final_weight=4.0, weight_power=1.5,
+                start_latent=None, initial_samples=None, keyframes=None, end_latent=None, denoise_strength=1.0, keyframe_indices=None):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -427,9 +434,31 @@ class FramePackSampler:
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
             # clean_latents_pre を keyframes からセクションごとに取得。なければ start_latent
-            if keyframes is not None and keyframes.shape[2] > section_no:
-                clean_latents_pre = keyframes[:, :, section_no:section_no+1, :, :].to(history_latents)
-                print(f"keyframes shape: {keyframes.shape}")
+            if keyframes is not None and keyframes.shape[2] > 0 and keyframe_indices is not None and len(keyframe_indices) > 0:
+                kf_idx = None
+                for i, idx in enumerate(keyframe_indices):
+                    if section_no <= idx:
+                        kf_idx = i
+                        break
+                if kf_idx is not None:
+                    clean_latents_pre = keyframes[:, :, kf_idx:kf_idx+1, :, :].to(history_latents)
+                    if kf_idx > 0:
+                        idx_prev = keyframe_indices[kf_idx - 1]
+                        idx_next = keyframe_indices[kf_idx]
+                        dist_total = idx_next - idx_prev
+                        dist_now = section_no - idx_prev
+                        if dist_total > 0:
+                            t = dist_now / dist_total
+                            weight = initial_weight + (final_weight - initial_weight) * (t ** weight_power)
+                            clean_latents_pre = clean_latents_pre * weight
+                            print(f"[FramePackSampler] section {section_no}: keyframe {kf_idx} (section {idx_next}), weight={weight:.2f}")
+                        else:
+                            print(f"[FramePackSampler] section {section_no}: use keyframe {kf_idx} (section index {keyframe_indices[kf_idx]})")
+                    else:
+                        print(f"[FramePackSampler] section {section_no}: use keyframe {kf_idx} (section index {keyframe_indices[kf_idx]})")
+                else:
+                    clean_latents_pre = start_latent.to(history_latents)
+                    print(f"[FramePackSampler] section {section_no}: use start_latent (no keyframe index >= section_no)")
             else:
                 clean_latents_pre = start_latent.to(history_latents)
                 print(f"keyframes is None: uses start_latent")
@@ -504,6 +533,11 @@ class FramePackSampler:
                     callback=callback,
                 )
 
+            # 指定されたキーフレーム位置で先頭にkeyframeをcat → 上書きに変更
+            # if keyframe_indices is not None and section_no in keyframe_indices:
+                # print(f"[FramePackSampler] section {section_no}: overwrite first frame with keyframe {kf_idx}")
+                # generated_latentsの先頭フレームをclean_latents_preで上書き
+                # generated_latents[:, :, 0:1, :, :] = clean_latents_pre.to(generated_latents)
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
