@@ -276,8 +276,8 @@ class CreateKeyframes:
                 "index_b": ("INT", {"tooltip": "section index for latent_b"}),
                 "latent_c": ("LATENT",),
                 "index_c": ("INT", {"tooltip": "section index for latent_c"}),
-                "prev_keyframes": ("LATENT",),
-                "prev_keyframe_indices": ("LIST", {}),
+                "prev_keyframes": ("LATENT", {"default": None}),
+                "prev_keyframe_indices": ("LIST", {"default": []}),
             }
         }
     RETURN_TYPES = ("LATENT", "LIST")
@@ -287,21 +287,87 @@ class CreateKeyframes:
     DESCRIPTION = "Create keyframes latents and section indices. index_*: section index for each latent. Can be cascaded."
 
     def create_keyframes(self, latent_a, index_a, latent_b=None, index_b=None, latent_c=None, index_c=None, prev_keyframes=None, prev_keyframe_indices=None):
-        tensors = [latent_a["samples"]]
-        indices = [index_a]
+        tensors = []
+        indices = []
+        if prev_keyframes is not None and prev_keyframe_indices is not None:
+            tensors.append(prev_keyframes["samples"])
+            indices += list(prev_keyframe_indices)
+        tensors.append(latent_a["samples"])
+        indices.append(index_a)
         if latent_b is not None and index_b is not None:
             tensors.append(latent_b["samples"])
             indices.append(index_b)
         if latent_c is not None and index_c is not None:
             tensors.append(latent_c["samples"])
             indices.append(index_c)
-        if prev_keyframes is not None and prev_keyframe_indices is not None:
-            tensors = [prev_keyframes["samples"]] + tensors
-            indices = list(prev_keyframe_indices) + indices
-        keyframes = torch.cat(tensors, dim=2) if len(tensors) > 1 else tensors[0]
+        zipped = list(zip(indices, tensors))
+        zipped.sort(key=lambda x: x[0])
+        sorted_indices = [z[0] for z in zipped]
+        sorted_tensors = [z[1] for z in zipped]
+        keyframes = torch.cat(sorted_tensors, dim=2) if len(sorted_tensors) > 1 else sorted_tensors[0]
         print(f"keyframes shape: {keyframes.shape}")
-        print(f"keyframe_indices: {indices}")
-        return ({"samples": keyframes}, indices)
+        print(f"keyframe_indices: {sorted_indices}")
+        return ({"samples": keyframes}, sorted_indices)
+
+class CreatePositiveKeyframes:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "positive_a": ("CONDITIONING",),
+                "index_a": ("INT", {"tooltip": "section index for positive_a"}),
+            },
+            "optional": {
+                "positive_b": ("CONDITIONING",),
+                "index_b": ("INT", {"tooltip": "section index for positive_b"}),
+                "positive_c": ("CONDITIONING",),
+                "index_c": ("INT", {"tooltip": "section index for positive_c"}),
+                "prev_keyframes": ("LIST", {"default": []}),
+                "prev_keyframe_indices": ("LIST", {"default": []}),
+            }
+        }
+    RETURN_TYPES = ("CONDITIONING", "LIST", "LIST")
+    RETURN_NAMES = ("positive", "positive_keyframes", "positive_keyframe_indices")
+    FUNCTION = "create_positive_keyframes"
+    CATEGORY = "FramePackWrapper"
+    DESCRIPTION = "Create positive conditioning keyframes and section indices. All CONDITIONING shapes are padded/cropped to match. index_*: section index for each positive. Can be cascaded."
+
+    def pad_conditioning(self, cond, target_length=512):
+        import torch
+        vec = cond[0][0]
+        if vec.shape[1] < target_length:
+            pad_size = target_length - vec.shape[1]
+            vec = torch.cat([vec, torch.zeros(vec.shape[0], pad_size, *vec.shape[2:], device=vec.device, dtype=vec.dtype)], dim=1)
+        elif vec.shape[1] > target_length:
+            vec = vec[:, :target_length]
+        cond[0][0] = vec
+        return cond
+
+    def create_positive_keyframes(self, positive_a, index_a, positive, positive_b=None, index_b=None, positive_c=None, index_c=None, prev_keyframes=None, prev_keyframe_indices=None):
+        target_length = 512  # 512に固定
+        positive = self.pad_conditioning(positive, target_length)
+        keyframes = []
+        indices = []
+        if prev_keyframes is not None and prev_keyframe_indices is not None:
+            keyframes += list(prev_keyframes)
+            indices += list(prev_keyframe_indices)
+        keyframes.append(self.pad_conditioning(positive_a, target_length))
+        indices.append(index_a)
+        if positive_b is not None and index_b is not None:
+            keyframes.append(self.pad_conditioning(positive_b, target_length))
+            indices.append(index_b)
+        if positive_c is not None and index_c is not None:
+            keyframes.append(self.pad_conditioning(positive_c, target_length))
+            indices.append(index_c)
+        zipped = list(zip(indices, keyframes))
+        zipped.sort(key=lambda x: x[0])
+        sorted_indices = [z[0] for z in zipped]
+        sorted_keyframes = [z[1] for z in zipped]
+        print(f"[CreatePositiveKeyframes] positive[0][0].shape = {positive[0][0].shape}")
+        for i, kf in enumerate(sorted_keyframes):
+            print(f"[CreatePositiveKeyframes] keyframe {i} shape: {kf[0][0].shape}, index: {sorted_indices[i]}")
+        return positive, sorted_keyframes, sorted_indices
 
 class FramePackSampler:
     @classmethod
@@ -337,6 +403,8 @@ class FramePackSampler:
                 "keyframe_indices": ("LIST", {"tooltip": "section index for each keyframe (e.g. [0, 3, 5])"}),
                 "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "positive_keyframes": ("LIST", {"tooltip": "List of positive CONDITIONING for keyframes"}),
+                "positive_keyframe_indices": ("LIST", {"tooltip": "Section indices for each positive_keyframe"}),
             }
         }
 
@@ -347,7 +415,8 @@ class FramePackSampler:
 
     def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg, 
                 guidance_scale, seed, sampler, gpu_memory_preservation, initial_weight=1.0, final_weight=4.0, weight_power=1.5,
-                start_latent=None, initial_samples=None, keyframes=None, end_latent=None, denoise_strength=1.0, keyframe_indices=None):
+                start_latent=None, initial_samples=None, keyframes=None, end_latent=None, denoise_strength=1.0, keyframe_indices=None,
+                positive_keyframes=None, positive_keyframe_indices=None):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -448,8 +517,9 @@ class FramePackSampler:
                         dist_total = idx_next - idx_prev
                         dist_now = section_no - idx_prev
                         if dist_total > 0:
-                            t = dist_now / dist_total
-                            weight = initial_weight + (final_weight - initial_weight) * (t ** weight_power)
+                            t = (section_no - idx_prev) / dist_total
+                            # 逆順: 先頭で強く、だんだん弱く
+                            weight = initial_weight + (final_weight - initial_weight) * ((1 - t) ** weight_power)
                             clean_latents_pre = clean_latents_pre * weight
                             print(f"[FramePackSampler] section {section_no}: keyframe {kf_idx} (section {idx_next}), weight={weight:.2f}")
                         else:
@@ -493,6 +563,25 @@ class FramePackSampler:
                 print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
                 input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
           
+
+            # セクションごとのpositiveを選択
+            section_positive = positive
+            if positive_keyframes is not None and positive_keyframe_indices is not None and len(positive_keyframes) > 0:
+                kf_idx = None
+                for i, idx in enumerate(positive_keyframe_indices):
+                    if section_no <= idx:
+                        kf_idx = i
+                        break
+                if kf_idx is not None:
+                    section_positive = positive_keyframes[kf_idx]
+                    print(f"[FramePackSampler] section {section_no}: use positive_keyframe {kf_idx} (section index {positive_keyframe_indices[kf_idx]})")
+                else:
+                    section_positive = positive
+                    print(f"[FramePackSampler] section {section_no}: use default positive (no positive_keyframe index >= section_no)")
+            # ここでshapeをログ出力
+            print(f"[FramePackSampler] section {section_no}: section_positive[0][0].shape = {section_positive[0][0].shape}")
+            llama_vec = section_positive[0][0].to(base_dtype).to(device)
+            clip_l_pooler = section_positive[0][1]["pooled_output"].to(base_dtype).to(device)
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
@@ -558,6 +647,7 @@ NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
     "FramePackSampler": FramePackSampler,
     "CreateKeyframes": CreateKeyframes,
+    "CreatePositiveKeyframes": CreatePositiveKeyframes,
     "FramePackTorchCompileSettings": FramePackTorchCompileSettings,
     "FramePackFindNearestBucket": FramePackFindNearestBucket,
     "LoadFramePackModel": LoadFramePackModel,
@@ -566,6 +656,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadFramePackModel": "(Down)Load FramePackModel",
     "FramePackSampler": "FramePackSampler",
     "CreateKeyframes": "Create Keyframes",
+    "CreatePositiveKeyframes": "Create Positive Keyframes",
     "FramePackTorchCompileSettings": "Torch Compile Settings",
     "FramePackFindNearestBucket": "Find Nearest Bucket",
     "LoadFramePackModel": "Load FramePackModel",
