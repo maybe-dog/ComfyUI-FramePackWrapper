@@ -1,6 +1,8 @@
 **Notice: This is a fork by nirvash. This repository is a test version with added keyframe support, based on original ComfyUI-FramePackWrapper.  
 Original repository (kijai): https://github.com/kijai/ComfyUI-FramePackWrapper**
 
+![screenshot](images/screenshot-01.png)
+
 # ComfyUI Wrapper for [FramePack by lllyasviel](https://lllyasviel.github.io/frame_pack_gitpage/)
 
 # WORK IN PROGRESS

@@ -314,7 +314,6 @@ class CreatePositiveKeyframes:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "positive": ("CONDITIONING",),
                 "positive_a": ("CONDITIONING",),
                 "index_a": ("INT", {"tooltip": "section index for positive_a"}),
             },
@@ -327,47 +326,33 @@ class CreatePositiveKeyframes:
                 "prev_keyframe_indices": ("LIST", {"default": []}),
             }
         }
-    RETURN_TYPES = ("CONDITIONING", "LIST", "LIST")
-    RETURN_NAMES = ("positive", "positive_keyframes", "positive_keyframe_indices")
+    RETURN_TYPES = ("LIST", "LIST")
+    RETURN_NAMES = ("positive_keyframes", "positive_keyframe_indices")
     FUNCTION = "create_positive_keyframes"
     CATEGORY = "FramePackWrapper"
     DESCRIPTION = "Create positive conditioning keyframes and section indices. All CONDITIONING shapes are padded/cropped to match. index_*: section index for each positive. Can be cascaded."
 
-    def pad_conditioning(self, cond, target_length=512):
-        import torch
-        vec = cond[0][0]
-        if vec.shape[1] < target_length:
-            pad_size = target_length - vec.shape[1]
-            vec = torch.cat([vec, torch.zeros(vec.shape[0], pad_size, *vec.shape[2:], device=vec.device, dtype=vec.dtype)], dim=1)
-        elif vec.shape[1] > target_length:
-            vec = vec[:, :target_length]
-        cond[0][0] = vec
-        return cond
-
-    def create_positive_keyframes(self, positive_a, index_a, positive, positive_b=None, index_b=None, positive_c=None, index_c=None, prev_keyframes=None, prev_keyframe_indices=None):
-        target_length = 512  # 512に固定
-        positive = self.pad_conditioning(positive, target_length)
+    def create_positive_keyframes(self, positive_a, index_a, positive_b=None, index_b=None, positive_c=None, index_c=None, prev_keyframes=None, prev_keyframe_indices=None):
         keyframes = []
         indices = []
         if prev_keyframes is not None and prev_keyframe_indices is not None:
             keyframes += list(prev_keyframes)
             indices += list(prev_keyframe_indices)
-        keyframes.append(self.pad_conditioning(positive_a, target_length))
+        keyframes.append(positive_a)
         indices.append(index_a)
         if positive_b is not None and index_b is not None:
-            keyframes.append(self.pad_conditioning(positive_b, target_length))
+            keyframes.append(positive_b)
             indices.append(index_b)
         if positive_c is not None and index_c is not None:
-            keyframes.append(self.pad_conditioning(positive_c, target_length))
+            keyframes.append(positive_c)
             indices.append(index_c)
         zipped = list(zip(indices, keyframes))
         zipped.sort(key=lambda x: x[0])
         sorted_indices = [z[0] for z in zipped]
         sorted_keyframes = [z[1] for z in zipped]
-        print(f"[CreatePositiveKeyframes] positive[0][0].shape = {positive[0][0].shape}")
         for i, kf in enumerate(sorted_keyframes):
-            print(f"[CreatePositiveKeyframes] keyframe {i} shape: {kf[0][0].shape}, index: {sorted_indices[i]}")
-        return positive, sorted_keyframes, sorted_indices
+            print(f"[CreatePositiveKeyframes] keyframe {i} shape: {kf[0][0].shape}, device = {kf[0][0].device}, index: {sorted_indices[i]}")
+        return sorted_keyframes, sorted_indices
 
 class FramePackSampler:
     @classmethod
@@ -392,9 +377,6 @@ class FramePackSampler:
                     {
                         "default": 'unipc_bh1'
                     }),
-                "initial_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "キーフレームから最も遠いときの重み"}),
-                "final_weight": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "キーフレームに最も近いときの重み"}),
-                "weight_power": ("FLOAT", {"default": 1.5, "min": 0.1, "max": 5.0, "step": 0.01, "tooltip": "重みの増加カーブ（指数）"}),
             },
             "optional": {
                 "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
@@ -405,6 +387,7 @@ class FramePackSampler:
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "positive_keyframes": ("LIST", {"tooltip": "List of positive CONDITIONING for keyframes"}),
                 "positive_keyframe_indices": ("LIST", {"tooltip": "Section indices for each positive_keyframe"}),
+                "keyframe_weight": ("FLOAT", {"default": 1.5, "min": 0.1, "max": 10.0, "step": 0.1, "tooltip": "Keyframe multiplier: How much to emphasize the latent at keyframe positions."}),
             }
         }
 
@@ -414,12 +397,13 @@ class FramePackSampler:
     CATEGORY = "FramePackWrapper"
 
     def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg, 
-                guidance_scale, seed, sampler, gpu_memory_preservation, initial_weight=1.0, final_weight=4.0, weight_power=1.5,
+                guidance_scale, seed, sampler, gpu_memory_preservation, 
                 start_latent=None, initial_samples=None, keyframes=None, end_latent=None, denoise_strength=1.0, keyframe_indices=None,
-                positive_keyframes=None, positive_keyframe_indices=None):
+                positive_keyframes=None, positive_keyframe_indices=None, keyframe_weight=2.0, force_keyframe=False):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
+        force_keyframe = False
 
         transformer = model["transformer"]
         base_dtype = model["dtype"]
@@ -442,10 +426,31 @@ class FramePackSampler:
         print("start_latent", start_latent.shape)
         B, C, T, H, W = start_latent.shape
 
+        print(f"[FramePackSampler] device: {device}")
+        print(f"[FramePackSampler] start_latent device: {start_latent.device}")
+        if keyframes is not None:
+            print(f"[FramePackSampler] keyframes device: {keyframes.device}")
+        if end_latent is not None:
+            print(f"[FramePackSampler] end_latent device: {end_latent.device}")
+        print(f"[FramePackSampler] positive[0][0] device: {positive[0][0].device}")
+        print(f"[FramePackSampler] negative[0][0] device: {negative[0][0].device}")
+
         image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(base_dtype).to(device)
 
         llama_vec = positive[0][0].to(base_dtype).to(device)
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         clip_l_pooler = positive[0][1]["pooled_output"].to(base_dtype).to(device)
+        cached_keyframe_vecs = []
+        cached_keyframe_masks = []
+        cached_keyframe_poolers = []
+        if positive_keyframes is not None:
+            for kf in positive_keyframes:
+                v = kf[0][0].to(base_dtype).to(device)
+                v, m = crop_or_pad_yield_mask(v, length=512)
+                p = kf[0][1]["pooled_output"].to(base_dtype).to(device)
+                cached_keyframe_vecs.append(v)
+                cached_keyframe_masks.append(m)
+                cached_keyframe_poolers.append(p)
 
         if not math.isclose(cfg, 1.0):
             llama_vec_n = negative[0][0].to(base_dtype)
@@ -492,7 +497,7 @@ class FramePackSampler:
             latent_paddings_list = latent_paddings.copy()
         for section_no, latent_padding in enumerate(latent_paddings):
             print(f"latent_padding: {latent_padding}")
-            print(f"secton no: {section_no}")
+            print(f"section no: {section_no}")
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
 
@@ -503,32 +508,40 @@ class FramePackSampler:
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
             # clean_latents_pre を keyframes からセクションごとに取得。なければ start_latent
+            current_keyframe = start_latent.to(history_latents)
+            # --- キーフレーム選択・weightロジック（先頭区間の特別扱いを追加） ---
+            total_sections = len(latent_paddings)
+            forward_section_no = total_sections - 1 - section_no
+            current_keyframe = start_latent.to(history_latents)
+            idx_current = 0
+            next_idx = None
             if keyframes is not None and keyframes.shape[2] > 0 and keyframe_indices is not None and len(keyframe_indices) > 0:
-                kf_idx = None
-                for i, idx in enumerate(keyframe_indices):
-                    if section_no <= idx:
-                        kf_idx = i
-                        break
-                if kf_idx is not None:
-                    clean_latents_pre = keyframes[:, :, kf_idx:kf_idx+1, :, :].to(history_latents)
-                    if kf_idx > 0:
-                        idx_prev = keyframe_indices[kf_idx - 1]
-                        idx_next = keyframe_indices[kf_idx]
-                        dist_total = idx_next - idx_prev
-                        dist_now = section_no - idx_prev
-                        if dist_total > 0:
-                            t = (section_no - idx_prev) / dist_total
-                            # 逆順: 先頭で強く、だんだん弱く
-                            weight = initial_weight + (final_weight - initial_weight) * ((1 - t) ** weight_power)
-                            clean_latents_pre = clean_latents_pre * weight
-                            print(f"[FramePackSampler] section {section_no}: keyframe {kf_idx} (section {idx_next}), weight={weight:.2f}")
-                        else:
-                            print(f"[FramePackSampler] section {section_no}: use keyframe {kf_idx} (section index {keyframe_indices[kf_idx]})")
-                    else:
-                        print(f"[FramePackSampler] section {section_no}: use keyframe {kf_idx} (section index {keyframe_indices[kf_idx]})")
+                if forward_section_no < keyframe_indices[0]:
+                    # 先頭より前の区間: start_latent→最初のキーフレーム
+                    current_keyframe = start_latent.to(history_latents)
+                    idx_current = 0
+                    next_idx = keyframe_indices[0]
+                elif forward_section_no >= keyframe_indices[-1]:
+                    # 最後のキーフレーム以降: 最後のキーフレーム→末尾
+                    current_keyframe = keyframes[:, :, -1:, :, :].to(history_latents)
+                    idx_current = keyframe_indices[-1]
+                    next_idx = total_sections - 1
                 else:
-                    clean_latents_pre = start_latent.to(history_latents)
-                    print(f"[FramePackSampler] section {section_no}: use start_latent (no keyframe index >= section_no)")
+                    for i in range(1, len(keyframe_indices)):
+                        if keyframe_indices[i-1] <= forward_section_no < keyframe_indices[i]:
+                            current_keyframe = keyframes[:, :, i-1:i, :, :].to(history_latents)
+                            idx_current = keyframe_indices[i-1]
+                            next_idx = keyframe_indices[i]
+                            break
+                # t計算: 分母が0（同じキーフレームindexが複数回設定など）の場合はt=1.0で回避
+                width = next_idx - idx_current if next_idx is not None else 1
+                if width == 0:
+                    t = 1.0
+                else:
+                    t = (next_idx - forward_section_no) / width
+                weight = 1.0 + (keyframe_weight - 1.0) * t
+                clean_latents_pre = current_keyframe * weight
+                print(f"[FramePackSampler] forward_section_no={forward_section_no}: use keyframe {idx_current} (next {next_idx}), weight={weight:.2f}, t={t:.2f}")
             else:
                 clean_latents_pre = start_latent.to(history_latents)
                 print(f"keyframes is None: uses start_latent")
@@ -566,22 +579,34 @@ class FramePackSampler:
 
             # セクションごとのpositiveを選択
             section_positive = positive
+            use_keyframe_positive = False
+            current_llama_vec = llama_vec
+            current_llama_attention_mask = llama_attention_mask
+            current_clip_l_pooler = clip_l_pooler
             if positive_keyframes is not None and positive_keyframe_indices is not None and len(positive_keyframes) > 0:
+                total_sections = len(latent_paddings)
+                forward_section_no = total_sections - 1 - section_no
                 kf_idx = None
                 for i, idx in enumerate(positive_keyframe_indices):
-                    if section_no <= idx:
+                    if forward_section_no <= idx:
                         kf_idx = i
                         break
                 if kf_idx is not None:
                     section_positive = positive_keyframes[kf_idx]
-                    print(f"[FramePackSampler] section {section_no}: use positive_keyframe {kf_idx} (section index {positive_keyframe_indices[kf_idx]})")
+                    use_keyframe_positive = True
+                    current_llama_vec = cached_keyframe_vecs[kf_idx]
+                    current_llama_attention_mask = cached_keyframe_masks[kf_idx]
+                    current_clip_l_pooler = cached_keyframe_poolers[kf_idx]
+                    print(f"[FramePackSampler] section {section_no} (forward {forward_section_no}): use positive_keyframe {kf_idx} (user index {positive_keyframe_indices[kf_idx]})")
                 else:
-                    section_positive = positive
-                    print(f"[FramePackSampler] section {section_no}: use default positive (no positive_keyframe index >= section_no)")
-            # ここでshapeをログ出力
+                    # forward_section_no が最後のキーフレームindexより大きい場合は最終キーフレームを使う
+                    section_positive = positive_keyframes[-1]
+                    use_keyframe_positive = True
+                    current_llama_vec = cached_keyframe_vecs[-1]
+                    current_llama_attention_mask = cached_keyframe_masks[-1]
+                    current_clip_l_pooler = cached_keyframe_poolers[-1]
+                    print(f"[FramePackSampler] section {section_no} (forward {forward_section_no}): use last positive_keyframe (user index {positive_keyframe_indices[-1]})")
             print(f"[FramePackSampler] section {section_no}: section_positive[0][0].shape = {section_positive[0][0].shape}")
-            llama_vec = section_positive[0][0].to(base_dtype).to(device)
-            clip_l_pooler = section_positive[0][1]["pooled_output"].to(base_dtype).to(device)
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
@@ -603,9 +628,9 @@ class FramePackSampler:
                     shift=shift if shift != 0 else None,
                     num_inference_steps=steps,
                     generator=rnd,
-                    prompt_embeds=llama_vec,
-                    prompt_embeds_mask=llama_attention_mask,
-                    prompt_poolers=clip_l_pooler,
+                    prompt_embeds=current_llama_vec,
+                    prompt_embeds_mask=current_llama_attention_mask,
+                    prompt_poolers=current_clip_l_pooler,
                     negative_prompt_embeds=llama_vec_n,
                     negative_prompt_embeds_mask=llama_attention_mask_n,
                     negative_prompt_poolers=clip_l_pooler_n,
@@ -622,11 +647,13 @@ class FramePackSampler:
                     callback=callback,
                 )
 
-            # 指定されたキーフレーム位置で先頭にkeyframeをcat → 上書きに変更
-            # if keyframe_indices is not None and section_no in keyframe_indices:
-                # print(f"[FramePackSampler] section {section_no}: overwrite first frame with keyframe {kf_idx}")
-                # generated_latentsの先頭フレームをclean_latents_preで上書き
-                # generated_latents[:, :, 0:1, :, :] = clean_latents_pre.to(generated_latents)
+            # キーフレーム強制オプションが有効な場合、current_keyframe（weightなし）で上書き
+            # うまく前後がつながらないので蓋してます
+            if force_keyframe and (keyframes is not None and keyframe_indices is not None):
+                if section_no in keyframe_indices:
+                    print(f"[FramePackSampler] section {section_no}: blend first frame with keyframe (no weight, 50%)")
+                    generated_latents[:, :, 0:1, :, :] = current_keyframe.to(generated_latents)
+
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
