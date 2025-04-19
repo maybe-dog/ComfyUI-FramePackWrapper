@@ -9,6 +9,8 @@ https://github.com/user-attachments/assets/d4af1e9b-904f-41aa-8a00-4306ed4ff4b0
 ## Keyframe test
 https://github.com/user-attachments/assets/23e777e5-dd49-444f-bccf-69b4d00625a2
 
+https://github.com/user-attachments/assets/dbc4444e-5e6d-41ad-b1ff-801f27ca86cf
+
 ## Feature
  - Set end frame
  - Assign weighted keyframes
