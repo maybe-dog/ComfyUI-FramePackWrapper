@@ -298,6 +298,7 @@ class CreateKeyframes:
         for i, t in enumerate(tensors):
             print(f"tensors[{i}] shape: {t.shape}")
         keyframes = torch.cat(tensors, dim=2) if len(tensors) > 1 else tensors[0]
+        print(f"keyframes shape: {keyframes.shape}")
         return ({"samples": keyframes},)
 
 class FramePackSampler:
@@ -328,6 +329,7 @@ class FramePackSampler:
                 "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
                 "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
                 "keyframes": ("LATENT", {"tooltip": "init Lantents to use for image2video keyframes"} ),
+                "end_latent": ("LATENT", {"tooltip": "end Latents to use for last frame"} ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             }
         }
@@ -338,7 +340,7 @@ class FramePackSampler:
     CATEGORY = "FramePackWrapper"
 
     def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg, 
-                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, initial_samples=None, keyframes=None, denoise_strength=1.0):
+                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, initial_samples=None, keyframes=None, end_latent=None, denoise_strength=1.0):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -358,6 +360,9 @@ class FramePackSampler:
             initial_samples = initial_samples["samples"] * vae_scaling_factor
         if keyframes is not None:
             keyframes = keyframes["samples"] * vae_scaling_factor
+            print(f"keyframes shape: {keyframes.shape}")
+        if end_latent is not None:
+            end_latent = end_latent["samples"] * vae_scaling_factor
         print("start_latent", start_latent.shape)
         B, C, T, H, W = start_latent.shape
 
@@ -424,9 +429,15 @@ class FramePackSampler:
             # clean_latents_pre を keyframes からセクションごとに取得。なければ start_latent
             if keyframes is not None and keyframes.shape[2] > section_no:
                 clean_latents_pre = keyframes[:, :, section_no:section_no+1, :, :].to(history_latents)
+                print(f"keyframes shape: {keyframes.shape}")
             else:
                 clean_latents_pre = start_latent.to(history_latents)
+                print(f"keyframes is None: uses start_latent")
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+            # end_latent対応: 最初のセクションでclean_latents_postをend_latentで差し替え
+            if section_no == 0 and end_latent is not None:
+                print(f"[FramePackSampler] end_latent is set. Overwriting clean_latents_post. old shape: {clean_latents_post.shape}, new shape: {end_latent.shape}")
+                clean_latents_post = end_latent.to(clean_latents_post)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
             #vid2vid
