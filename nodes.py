@@ -5,6 +5,7 @@ import gc
 import numpy as np
 import math
 from tqdm import tqdm
+import re
 
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
@@ -670,6 +671,146 @@ class FramePackSampler:
 
         return {"samples": real_history_latents / vae_scaling_factor},
     
+
+class TimestampPromptParser:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"multiline": True, "default": 
+                    "A cute girl is standing\n"
+                    "[0s-2s: She claps her hands cheerfully]\n"
+                    "[2s-: The girl spins around with a smile]", "tooltip": "FramePack timestamp prompt (use 'sec' for seconds, 's' for section index)"}),
+                "clip": ("CLIP", {"tooltip": "CLIP model for encoding"}),
+            },
+            "optional": {
+                "total_second_length": ("FLOAT", {"default": 12.0, "min": 1.0, "max": 120.0, "step": 0.1, "tooltip": "動画全体の長さ（秒）。未指定時は12秒 or timestamp最大値"}),
+            }
+        }
+    RETURN_TYPES = ("LIST", "LIST", "STRING")
+    RETURN_NAMES = ("positive_keyframes", "positive_keyframe_indices", "keyframe_prompts")
+    FUNCTION = "parse"
+    CATEGORY = "FramePackWrapper"
+    DESCRIPTION = (
+        "Parses FramePack-style timestamp prompts and encodes them with CLIP for each section. "
+        "General prompts (not enclosed in brackets) are included in every section. "
+        "Timestamp prompts are appended to the relevant sections, and multiple timestamp prompts can overlap. "
+        "Section length is 1.2 seconds. If total_second_length is not specified, it defaults to 12 seconds or the maximum timestamp.\n"
+        "\n"
+        "Timestamp prompt format examples:\n"
+        "  [1sec: The person waves hello] [2sec: The person jumps up and down] [4sec: The person does a spin]\n"
+        "  [0sec-2sec: The person stands still, looking at the camera] [2sec-4sec: The person raises both arms gracefully above their head] [4sec-6sec: The person does a gentle spin with arms extended] [6sec: The person bows elegantly with a smile]\n"
+        "  [-1sec: Applies from the beginning to 1sec] [5sec-: Applies from 5sec to the end]\n"
+        "General prompts (not in brackets) are always included in all sections.\n"
+        "\n"
+        "Supported timestamp prompt formats:\n"
+        "  [startsec: description]         e.g. [1sec: ...]\n"
+        "  [startsec-endsec: description]  e.g. [0sec-2sec: ...]\n"
+        "  [-endsec: description]          e.g. [-1sec: ...] (from start to end)\n"
+        "  [startsec-: description]        e.g. [5sec-: ...] (from start to end of video)\n"
+        "\n"
+        "If you use 's' instead of 'sec', it is interpreted as section index (not seconds)."
+    )
+
+    def parse(self, text, clip, total_second_length=12.0):
+        # timestamp promptのパース
+        # 'sec'（秒）と's'（section index）両対応
+        pattern = r'\[(?:(-)?(\d+\.?\d*)(sec|s))?(?:-(?:(\d+\.?\d*)(sec|s))?)?:\s*([^\]]+)\]'
+        matches = re.findall(pattern, text)
+        timestamp_prompts = []
+        max_time = 0.0
+        section_length = 1.2  # 秒
+        for minus, start, start_unit, end, end_unit, desc in matches:
+            # 区間をsection indexで管理
+            if start_unit == 's' or end_unit == 's':
+                # section index指定
+                def to_section(val):
+                    return int(float(val))
+                if minus == '-':
+                    section_start = 0
+                    section_end = to_section(start)
+                elif start and end:
+                    section_start = to_section(start)
+                    section_end = to_section(end)
+                elif start and not end:
+                    section_start = to_section(start)
+                    section_end = None
+                elif end and not start:
+                    section_start = 0
+                    section_end = to_section(end)
+                else:
+                    section_start = to_section(start) if start else 0
+                    section_end = section_start
+            else:
+                # 秒指定（sec）→section indexに変換
+                def to_sec(val):
+                    return float(val)
+                if minus == '-':
+                    sec_start = 0.0
+                    sec_end = to_sec(start)
+                elif start and end:
+                    sec_start = to_sec(start)
+                    sec_end = to_sec(end)
+                elif start and not end:
+                    sec_start = to_sec(start)
+                    sec_end = None
+                elif end and not start:
+                    sec_start = 0.0
+                    sec_end = to_sec(end)
+                else:
+                    sec_start = to_sec(start) if start else 0.0
+                    sec_end = sec_start
+                section_start = int(sec_start // section_length)
+                section_end = int(sec_end // section_length) if sec_end is not None else None
+                if sec_end is not None:
+                    max_time = max(max_time, sec_end)
+                else:
+                    max_time = max(max_time, sec_start)
+            timestamp_prompts.append({
+                "section_start": section_start,
+                "section_end": section_end,
+                "desc": desc.strip()
+            })
+        # generalプロンプト（時刻指定なし）を抽出
+        text_wo_timestamps = re.sub(pattern, '', text)
+        general_prompt = text_wo_timestamps.strip() if text_wo_timestamps.strip() else None
+
+        # section数の決定
+        if not total_second_length or total_second_length < 1.0:
+            total_second_length = max(12.0, max_time)
+        else:
+            total_second_length = max(total_second_length, max_time)
+        num_sections = math.ceil(total_second_length / section_length)
+
+        # 各sectionごとにプロンプトリストを作成
+        section_prompts = []
+        for section_no in range(num_sections):
+            prompts = []
+            if general_prompt:
+                prompts.append(general_prompt)
+            for tp in timestamp_prompts:
+                tp_start = tp["section_start"]
+                tp_end = tp["section_end"] if tp["section_end"] is not None else num_sections
+                if tp_start <= section_no < tp_end:
+                    prompts.append(tp["desc"])
+            section_prompts.append(" ".join(prompts))
+
+        # プロンプトごとにCLIPエンコードし、同じプロンプトはまとめる（最適化）
+        keyframes = []
+        indices = []
+        keyframe_prompts = []
+        last_prompt = None
+        for i, prompt in enumerate(section_prompts):
+            if prompt != last_prompt:
+                tokens = clip.tokenize(prompt)
+                cond = clip.encode_from_tokens_scheduled(tokens)
+                keyframes.append(cond)
+                indices.append(i)
+                keyframe_prompts.append(prompt)
+                last_prompt = prompt
+        keyframe_prompts_str = ",\n".join(keyframe_prompts)
+        return keyframes, indices, keyframe_prompts_str
+
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
     "FramePackSampler": FramePackSampler,
@@ -678,6 +819,7 @@ NODE_CLASS_MAPPINGS = {
     "FramePackTorchCompileSettings": FramePackTorchCompileSettings,
     "FramePackFindNearestBucket": FramePackFindNearestBucket,
     "LoadFramePackModel": LoadFramePackModel,
+    "TimestampPromptParser": TimestampPromptParser,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadFramePackModel": "(Down)Load FramePackModel",
@@ -687,5 +829,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FramePackTorchCompileSettings": "Torch Compile Settings",
     "FramePackFindNearestBucket": "Find Nearest Bucket",
     "LoadFramePackModel": "Load FramePackModel",
+    "TimestampPromptParser": "Timestamp Prompt Parser",
     }
 
