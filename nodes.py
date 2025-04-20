@@ -685,8 +685,10 @@ class TimestampPromptParser:
             },
             "optional": {
                 "total_second_length": ("FLOAT", {"default": 12.0, "min": 1.0, "max": 120.0, "step": 0.1, "tooltip": "動画全体の長さ（秒）。未指定時は12秒 or timestamp最大値"}),
+                "weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Prompt weight (applied to all prompts)"}),
             }
         }
+
     RETURN_TYPES = ("LIST", "LIST", "STRING")
     RETURN_NAMES = ("positive_keyframes", "positive_keyframe_indices", "keyframe_prompts")
     FUNCTION = "parse"
@@ -712,7 +714,7 @@ class TimestampPromptParser:
         "If you use 's' instead of 'sec', it is interpreted as section index (not seconds)."
     )
 
-    def parse(self, text, clip, total_second_length=12.0):
+    def parse(self, text, clip, total_second_length=12.0, weight=1.0):
         # timestamp promptのパース
         # 'sec'（秒）と's'（section index）両対応
         pattern = r'\[(?:(-)?(\d+\.?\d*)(sec|s))?(?:-(?:(\d+\.?\d*)(sec|s))?)?:\s*([^\]]+)\]'
@@ -804,6 +806,11 @@ class TimestampPromptParser:
             if prompt != last_prompt:
                 tokens = clip.tokenize(prompt)
                 cond = clip.encode_from_tokens_scheduled(tokens)
+                # weightを適用
+                if weight != 1.0:
+                    # condはタプルやリストの可能性があるので、最初のテンソルにweightを掛ける
+                    if isinstance(cond, (tuple, list)) and hasattr(cond[0][0], 'mul_'):
+                        cond[0][0] = cond[0][0] * weight
                 keyframes.append(cond)
                 indices.append(i)
                 keyframe_prompts.append(prompt)
