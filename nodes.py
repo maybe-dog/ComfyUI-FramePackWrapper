@@ -788,13 +788,13 @@ class TimestampPromptParser:
         section_prompts = []
         for section_no in range(num_sections):
             prompts = []
-            if general_prompt:
-                prompts.append(general_prompt)
             for tp in timestamp_prompts:
                 tp_start = tp["section_start"]
                 tp_end = tp["section_end"] if tp["section_end"] is not None else num_sections
                 if tp_start <= section_no < tp_end:
                     prompts.append(tp["desc"])
+            if general_prompt:
+                prompts.append(general_prompt)  # general promptを末尾に追加
             section_prompts.append(" ".join(prompts))
 
         # プロンプトごとにCLIPエンコードし、同じプロンプトはまとめる（最適化）
