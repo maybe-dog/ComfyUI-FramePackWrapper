@@ -295,6 +295,8 @@ class FramePackSampler:
                 "start_embed_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Weighted average constant for image embed interpolation. If end image is not set, the embed's strength won't be affected"}),
                 "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "prev_samples": ("LATENT", {"default": None, "tooltip": "Latents from previous sampler. If provided, used as history_latents."}),
+                "insert_start_latent": ("BOOLEAN", {"default": True, "tooltip": "If True, concatenates start_latent at the last section."}),
             }
         }
 
@@ -304,7 +306,7 @@ class FramePackSampler:
     CATEGORY = "FramePackWrapper"
 
     def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg,
-                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0):
+                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0, prev_samples=None, insert_start_latent=True):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -356,7 +358,17 @@ class FramePackSampler:
         
         num_frames = latent_window_size * 4 - 3
 
-        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
+        if prev_samples is not None:
+            prev_latents = prev_samples["samples"] * vae_scaling_factor
+            num_required_frames = 1 + 2 + 16
+            if prev_latents.shape[2] < num_required_frames:
+                num_padding_frames = num_required_frames - prev_latents.shape[2]
+                padding_latents = torch.zeros((prev_latents.shape[0], prev_latents.shape[1], num_padding_frames, prev_latents.shape[3], prev_latents.shape[4]), dtype=prev_latents.dtype, device=prev_latents.device)
+                history_latents = torch.cat([prev_latents, padding_latents], dim=2).cpu()
+            else:
+                history_latents = prev_latents[:, :, :num_required_frames, :, :].cpu()
+        else:
+            history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
        
         total_generated_latent_frames = 0
 
@@ -478,7 +490,7 @@ class FramePackSampler:
                     callback=callback,
                 )
 
-            if is_last_section:
+            if is_last_section and insert_start_latent:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
             total_generated_latent_frames += int(generated_latents.shape[2])
@@ -494,12 +506,35 @@ class FramePackSampler:
 
         return {"samples": real_history_latents / vae_scaling_factor},
     
+class FramePackConcatSamples:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "samples1": ("LATENT", {"tooltip": "Future samples"}),
+                "samples2": ("LATENT", {"tooltip": "Past samples"}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", )
+    RETURN_NAMES = ("samples", )
+    FUNCTION = "process"
+    CATEGORY = "FramePackWrapper"
+    DESCRIPTION = "Concatenate two latent tensors along the T dimension (dim=2). samples2 (past) comes before samples1 (future)."
+
+    def process(self, samples1, samples2):
+        t1 = samples1["samples"] if isinstance(samples1, dict) else samples1
+        t2 = samples2["samples"] if isinstance(samples2, dict) else samples2
+        out = torch.cat([t2, t1], dim=2)
+        return ({"samples": out},)
+
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
     "FramePackSampler": FramePackSampler,
     "FramePackTorchCompileSettings": FramePackTorchCompileSettings,
     "FramePackFindNearestBucket": FramePackFindNearestBucket,
     "LoadFramePackModel": LoadFramePackModel,
+    "FramePackConcatSamples": FramePackConcatSamples,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadFramePackModel": "(Down)Load FramePackModel",
@@ -507,5 +542,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FramePackTorchCompileSettings": "Torch Compile Settings",
     "FramePackFindNearestBucket": "Find Nearest Bucket",
     "LoadFramePackModel": "Load FramePackModel",
+    "FramePackConcatSamples": "Concat Samples",
     }
 
