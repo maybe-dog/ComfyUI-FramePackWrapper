@@ -549,19 +549,42 @@ class FramePackSampler:
             section_start_idx + num_sections,
             total_generated_latent_frames
         )
-    
+
+class FramePackLatentSlice:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "samples": ("LATENT",),
+                "start_idx": ("INT", {"default": 0, "min": 0}),
+                "count": ("INT", {"default": 9, "min": 1}),
+            }
+        }
+    CATEGORY = "FramePackWrapper"
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
+    FUNCTION = "slice_latent"
+
+    def slice_latent(self, samples: dict, start_idx: int, count: int):
+        # Assume samples["samples"] shape: [B, C, T, H, W]
+        out = samples.copy()
+        out["samples"] = samples["samples"][:, :, start_idx:start_idx+count, :, :]
+        return (out,)
+
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
     "FramePackSampler": FramePackSampler,
     "FramePackTorchCompileSettings": FramePackTorchCompileSettings,
     "FramePackFindNearestBucket": FramePackFindNearestBucket,
     "LoadFramePackModel": LoadFramePackModel,
-    }
+    "FramePackLatentSlice": FramePackLatentSlice,
+}
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadFramePackModel": "(Down)Load FramePackModel",
     "FramePackSampler": "FramePackSampler",
     "FramePackTorchCompileSettings": "Torch Compile Settings",
     "FramePackFindNearestBucket": "Find Nearest Bucket",
     "LoadFramePackModel": "Load FramePackModel",
-    }
+    "FramePackLatentSlice": "FramePackLatentSlice",
+}
 
