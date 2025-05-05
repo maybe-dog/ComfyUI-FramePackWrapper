@@ -391,16 +391,17 @@ class FramePackSampler:
                 "start_embed_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Weighted average constant for image embed interpolation. If end image is not set, the embed's strength won't be affected"}),
                 "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "history_latents": ("LATENT", {"default": None, "tooltip": "Optional: Provide previous history_latents"}),
             }
         }
 
-    RETURN_TYPES = ("LATENT", )
-    RETURN_NAMES = ("samples",)
+    RETURN_TYPES = ("LATENT", "LATENT", )
+    RETURN_NAMES = ("samples", "history_latents",)
     FUNCTION = "process"
     CATEGORY = "FramePackWrapper"
 
     def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg,
-                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0):
+                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0, history_latents=None):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -452,9 +453,29 @@ class FramePackSampler:
         
         num_frames = latent_window_size * 4 - 3
 
-        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
-       
+        # history_latents の初期化と total_generated_latent_frames の設定
         total_generated_latent_frames = 0
+        if history_latents is not None:
+            history_latents = history_latents["samples"] if isinstance(history_latents, dict) and "samples" in history_latents else history_latents
+            history_latents = history_latents.to(torch.float32).cpu()
+        
+            # shape チェック: [1, 16, T, H, W] かつ H, W が start_latent と一致
+            if (history_latents.ndim != 5 or history_latents.shape[0] != 1 or history_latents.shape[1] != 16 or
+                history_latents.shape[3] != H or history_latents.shape[4] != W):
+                raise ValueError(f"history_latents の shape が不正です: {history_latents.shape} (期待: [1, 16, T, {H}, {W}])")
+            
+            print            
+            total_generated_latent_frames = int(history_latents.shape[2])
+            
+            required_T = 1 + 2 + 16
+            if history_latents.shape[2] < required_T:
+                pad_T = required_T - history_latents.shape[2]
+                pad_latents = torch.zeros(size=(1, 16, pad_T, H, W), dtype=torch.float32).cpu()
+                history_latents = torch.cat([history_latents, pad_latents], dim=2)
+        else:
+            history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
+
+        real_history_latents = None       
 
         latent_paddings_list = list(reversed(range(total_latent_sections)))
         latent_paddings = latent_paddings_list.copy()  # Create a copy for iteration
@@ -591,7 +612,10 @@ class FramePackSampler:
         transformer.to(offload_device)
         mm.soft_empty_cache()
 
-        return {"samples": real_history_latents / vae_scaling_factor},
+        # 出力する real_history_latents から最終セクションで追加された start_latent を除外
+        output_history_latents = real_history_latents[:, :, 1:, :, :]
+
+        return {"samples": real_history_latents / vae_scaling_factor}, {"samples": output_history_latents}
     
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
