@@ -298,7 +298,6 @@ class FramePackSampler:
                 "section_start_idx": ("INT", {"default": 0, "min": 0, "tooltip": "Start index of section"}),
                 "num_sections": ("INT", {"default": -1, "min": -1, "tooltip": "Number of sections to process (-1 for all)"}),
                 "history_latents": ("LATENT", ),
-                "total_generated_latent_frames": ("INT", {"default": 0, "min": 0, "tooltip": "Total generated latent frames"}),
             }
         }
 
@@ -314,7 +313,6 @@ class FramePackSampler:
         "LATENT",
         "FLOAT",
         "INT",
-        "INT"
     )
     RETURN_NAMES = (
         "samples",
@@ -328,14 +326,13 @@ class FramePackSampler:
         "history_latents",
         "total_second_length",
         "next_section_start_idx",
-        "total_generated_latent_frames"
     )
     FUNCTION = "process"
     CATEGORY = "FramePackWrapper"
 
     def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg,
                 guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0,
-                section_start_idx=0, num_sections=-1, history_latents=None, total_generated_latent_frames=0):
+                section_start_idx=0, num_sections=-1, history_latents=None):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -387,10 +384,15 @@ class FramePackSampler:
         
         num_frames = latent_window_size * 4 - 3
 
+        total_generated_latent_frames = 0
         if history_latents is None:
             history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
         else:
             history_latents = history_latents["samples"]
+            total_generated_latent_frames = history_latents.shape[2] - 1 - 2 - 16
+
+        print("history_latents", history_latents.shape)
+        print("total_generated_latent_frames", total_generated_latent_frames)
         real_history_latents = None
 
         latent_paddings_list = list(reversed(range(total_latent_sections)))
@@ -416,6 +418,7 @@ class FramePackSampler:
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
             latent_paddings_list = latent_paddings.copy()
 
+        is_last_section = False
         if num_sections == -1:
             num_sections = total_latent_sections - section_start_idx
         section_end_idx = min(section_start_idx + num_sections, total_latent_sections)
@@ -517,9 +520,6 @@ class FramePackSampler:
                     callback=callback,
                 )
 
-            if is_last_section:
-                generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
-
             total_generated_latent_frames += int(generated_latents.shape[2])
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
@@ -534,6 +534,9 @@ class FramePackSampler:
         if real_history_latents is None:
             # If no latents were generated, return the original history latents
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
+        else:
+            if is_last_section:
+                real_history_latents = torch.cat([start_latent.to(real_history_latents), real_history_latents], dim=2)
 
         return (
             {"samples": real_history_latents / vae_scaling_factor},
@@ -547,7 +550,6 @@ class FramePackSampler:
             {"samples": history_latents},
             total_second_length,
             section_start_idx + num_sections,
-            total_generated_latent_frames
         )
     
 NODE_CLASS_MAPPINGS = {
