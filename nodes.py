@@ -786,7 +786,7 @@ class FramePackSamplerF1:
         
         num_frames = latent_window_size * 4 - 3
 
-        total_generated_latent_frames = 1 # history_latentsの最初の1フレームはstart_latentを使うので、1フレーム分すでに生成済みとする?
+        total_generated_latent_frames = 1 # 最初の1フレームはstart_latentを使うので、1フレーム分すでに生成済みとする?
         if history_latents is None:
             history_latents = torch.zeros(size=(1, 16, 16 + 2 + 1, H, W), dtype=torch.float32).cpu()
             history_latents = torch.cat([history_latents, start_latent.to(history_latents)], dim=2) # 初回はstart_latentsを後方に追加
@@ -817,6 +817,9 @@ class FramePackSamplerF1:
         if num_sections == -1:
             num_sections = total_latent_sections - section_start_idx
         section_end_idx = min(section_start_idx + num_sections, total_latent_sections)
+        print("num_sections", num_sections)
+        print("section_end_idx", section_end_idx)
+        print("total_latent_sections", total_latent_sections)
         for i in range(section_start_idx, section_end_idx):
             # Reset rnd with the same seed for each section to keep outputs identical whether using a single sampler or multiple chained samplers.
             rnd = torch.Generator("cpu").manual_seed(seed + i)
