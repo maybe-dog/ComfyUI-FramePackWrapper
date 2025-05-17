@@ -682,7 +682,10 @@ class FramePackSamplerF1:
                 "shift": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "latent_window_size": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1, "tooltip": "The size of the latent window to use for sampling."}),
-                "total_second_length": ("FLOAT", {"default": 5, "min": 1, "max": 120, "step": 0.1, "tooltip": "The total length of the video in seconds."}),
+                # F1では順方向にしかサンプリングしないので生成するセクション数だけ決めればよい
+                # "total_second_length": ("FLOAT", {"default": 5, "min": 1, "max": 120, "step": 0.1, "tooltip": "The total length of the video in seconds."}),
+                # その代わりnum_sectionsの指定を必須にする
+                "num_sections": ("INT", {"default": 1, "min": 1, "tooltip": "Number of sections to process for this node"}),
                 "gpu_memory_preservation": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 128.0, "step": 0.1, "tooltip": "The amount of GPU memory to preserve."}),
                 "sampler": (["unipc_bh1", "unipc_bh2"],
                     {
@@ -700,8 +703,8 @@ class FramePackSamplerF1:
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "t2v_width": ("INT", {"default": 640, "min": 8, "step": 8, "tooltip": "Text-to-video width."}),
                 "t2v_height": ("INT", {"default": 640, "min": 8, "step": 8, "tooltip": "Text-to-video height."}),
-                "section_start_idx": ("INT", {"default": 0, "min": 0, "tooltip": "Start index of section"}),
-                "num_sections": ("INT", {"default": -1, "min": -1, "tooltip": "Number of sections to process (-1 for all)"}),
+                # F1ではセクションの開始位置を指定する必要はない
+                # "section_start_idx": ("INT", {"default": 0, "min": 0, "tooltip": "Start index of section"}),
                 "history_latents": ("LATENT", ),
             }
         }
@@ -716,8 +719,8 @@ class FramePackSamplerF1:
         # "LATENT",
         # "CLIP_VISION_OUTPUT",
         "LATENT",
-        "FLOAT",
-        "INT",
+        # "FLOAT",
+        # "INT",
     )
     RETURN_NAMES = (
         "samples",
@@ -729,19 +732,15 @@ class FramePackSamplerF1:
         # "end_latent",
         # "end_embeds",
         "history_latents",
-        "total_second_length",
-        "next_section_start_idx",
+        # "total_second_length",
+        # "next_section_start_idx",
     )
     FUNCTION = "process"
     CATEGORY = "FramePackWrapper"
 
-    def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, steps, cfg,
+    def process(self, model, shift, positive, negative, latent_window_size, use_teacache, teacache_rel_l1_thresh, steps, cfg,
                 guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0,
-                t2v_width=None, t2v_height=None, section_start_idx=0, num_sections=-1, history_latents=None):
-        total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
-        total_latent_sections = int(max(round(total_latent_sections), 1))
-        print("total_latent_sections: ", total_latent_sections)
-
+                t2v_width=None, t2v_height=None, num_sections=1, history_latents=None):
         transformer = model["transformer"]
         base_dtype = model["dtype"]
 
@@ -786,10 +785,11 @@ class FramePackSamplerF1:
         
         num_frames = latent_window_size * 4 - 3
 
-        total_generated_latent_frames = 1 # 最初の1フレームはstart_latentを使うので、1フレーム分すでに生成済みとする?
+        total_generated_latent_frames = 0
         if history_latents is None:
             history_latents = torch.zeros(size=(1, 16, 16 + 2 + 1, H, W), dtype=torch.float32).cpu()
             history_latents = torch.cat([history_latents, start_latent.to(history_latents)], dim=2) # 初回はstart_latentsを後方に追加
+            total_generated_latent_frames = 1 # 初回は1フレーム分を初期画像そのまま使う
         else:
             history_latents = history_latents["samples"]
             total_generated_latent_frames = history_latents.shape[2] - 16 - 2 - 1
@@ -797,9 +797,6 @@ class FramePackSamplerF1:
         print("history_latents", history_latents.shape)
         print("total_generated_latent_frames", total_generated_latent_frames)
         real_history_latents = None
-
-        latent_paddings_list = list(reversed(range(total_latent_sections)))
-        latent_paddings = latent_paddings_list.copy()  # Create a copy for iteration
 
         comfy_model = HyVideoModel(
                 HyVideoModelConfig(base_dtype),
@@ -813,26 +810,15 @@ class FramePackSamplerF1:
 
         move_model_to_device_with_memory_preservation(transformer, target_device=device, preserved_memory_gb=gpu_memory_preservation)
 
-        is_last_section = False
-        if num_sections == -1:
-            num_sections = total_latent_sections - section_start_idx
-        section_end_idx = min(section_start_idx + num_sections, total_latent_sections)
-        print("num_sections", num_sections)
-        print("section_end_idx", section_end_idx)
-        print("total_latent_sections", total_latent_sections)
-        for i in range(section_start_idx, section_end_idx):
+        
+        for i in range(num_sections):
             # Reset rnd with the same seed for each section to keep outputs identical whether using a single sampler or multiple chained samplers.
             rnd = torch.Generator("cpu").manual_seed(seed + i)
 
-            latent_padding = latent_paddings[i]
-            is_last_section = (i == total_latent_sections - 1)
-            is_first_section = (section_start_idx == 0 and i == 0)
-            latent_padding_size = latent_padding * latent_window_size
-
-            print(f'section = {i}, latent_padding = {latent_padding}, latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
-
-            start_latent_frames = T  # 0 or 1
+            is_last_section = (i == num_sections - 1)
+            
             # 以下コメントアウトは通常のフロー
+            # start_latent_frames = T  # 0 or 1
             # indices = torch.arange(0, sum([start_latent_frames, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
             # clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([start_latent_frames, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
             # clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
@@ -847,29 +833,29 @@ class FramePackSamplerF1:
             clean_latents_4x, clean_latents_2x, clean_latents_1x = history_latents[:, :, -sum([16, 2, 1]):, :, :].split([16, 2, 1], dim=2)
             clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
 
+            # 一旦コメントアウト, 何に使うか分かってない
             #vid2vid WIP
+            # if initial_samples is not None:
+            #     total_length = initial_samples.shape[2]
 
-            if initial_samples is not None:
-                total_length = initial_samples.shape[2]
+            #     # Get the max padding value for normalization
+            #     max_padding = max(latent_paddings_list)
 
-                # Get the max padding value for normalization
-                max_padding = max(latent_paddings_list)
+            #     if is_last_section:
+            #         # Last section should capture the end of the sequence
+            #         start_idx = max(0, total_length - latent_window_size)
+            #     else:
+            #         # Calculate windows that distribute more evenly across the sequence
+            #         # This normalizes the padding values to create appropriate spacing
+            #         if max_padding > 0:  # Avoid division by zero
+            #             progress = (max_padding - latent_padding) / max_padding
+            #             start_idx = int(progress * max(0, total_length - latent_window_size))
+            #         else:
+            #             start_idx = 0
 
-                if is_last_section:
-                    # Last section should capture the end of the sequence
-                    start_idx = max(0, total_length - latent_window_size)
-                else:
-                    # Calculate windows that distribute more evenly across the sequence
-                    # This normalizes the padding values to create appropriate spacing
-                    if max_padding > 0:  # Avoid division by zero
-                        progress = (max_padding - latent_padding) / max_padding
-                        start_idx = int(progress * max(0, total_length - latent_window_size))
-                    else:
-                        start_idx = 0
-
-                end_idx = min(start_idx + latent_window_size, total_length)
-                print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
-                input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
+            #     end_idx = min(start_idx + latent_window_size, total_length)
+            #     print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
+            #     input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
 
 
             if use_teacache:
@@ -925,10 +911,6 @@ class FramePackSamplerF1:
         if real_history_latents is None:
             # If no latents were generated, return the original history latents
             real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
-        # 以下は通常バージョンの処理、F1では最後だから特別何かをするということはない
-        # else:
-        #     if is_last_section:
-        #         real_history_latents = torch.cat([start_latent.to(real_history_latents), real_history_latents], dim=2)
 
         return (
             {"samples": real_history_latents / vae_scaling_factor},
@@ -940,8 +922,8 @@ class FramePackSamplerF1:
             # end_latent_samples,
             # end_image_embeds,
             {"samples": history_latents},
-            total_second_length,
-            section_start_idx + num_sections,
+            # total_second_length,
+            # section_start_idx + num_sections,
         )
 
 NODE_CLASS_MAPPINGS = {
