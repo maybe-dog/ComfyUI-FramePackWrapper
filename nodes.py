@@ -711,6 +711,7 @@ class FramePackSamplerF1:
 
     RETURN_TYPES = (
         "LATENT",
+        "LATENT",
         "FramePackMODEL",
         "CONDITIONING",
         "CONDITIONING",
@@ -724,6 +725,7 @@ class FramePackSamplerF1:
     )
     RETURN_NAMES = (
         "samples",
+        "samples_for_this_section",
         "model",
         "positive",
         "negative",
@@ -893,6 +895,7 @@ class FramePackSamplerF1:
 
         return (
             {"samples": real_history_latents / vae_scaling_factor},
+            {"samples": generated_latents / vae_scaling_factor}, # sample for this section
             model,
             positive,
             negative,
