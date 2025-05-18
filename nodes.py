@@ -786,11 +786,15 @@ class FramePackSamplerF1:
         num_frames = latent_window_size * 4 - 3
 
         total_generated_latent_frames = 0
-        if history_latents is None:
+        if history_latents is None and initial_samples is not None: # 初回で動画を繋げる場合
+            history_latents = torch.zeros(size=(1, 16, 16 + 2 + 1, H, W), dtype=torch.float32).cpu()
+            history_latents = torch.cat([history_latents, initial_samples.to(history_latents)], dim=2) # 初回はinitial_latentsを後方に追加
+            total_generated_latent_frames = history_latents.shape[2] - 16 - 2 - 1
+        elif history_latents is None: # 画像から動画を生成する場合
             history_latents = torch.zeros(size=(1, 16, 16 + 2 + 1, H, W), dtype=torch.float32).cpu()
             history_latents = torch.cat([history_latents, start_latent.to(history_latents)], dim=2) # 初回はstart_latentsを後方に追加
             total_generated_latent_frames = 1 # 初回は1フレーム分を初期画像そのまま使う
-        else:
+        else: # 2回目以降の動画生成
             history_latents = history_latents["samples"]
             total_generated_latent_frames = history_latents.shape[2] - 16 - 2 - 1
 
@@ -832,31 +836,6 @@ class FramePackSamplerF1:
             clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
             clean_latents_4x, clean_latents_2x, clean_latents_1x = history_latents[:, :, -sum([16, 2, 1]):, :, :].split([16, 2, 1], dim=2)
             clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
-
-            # 一旦コメントアウト, 何に使うか分かってない
-            #vid2vid WIP
-            # if initial_samples is not None:
-            #     total_length = initial_samples.shape[2]
-
-            #     # Get the max padding value for normalization
-            #     max_padding = max(latent_paddings_list)
-
-            #     if is_last_section:
-            #         # Last section should capture the end of the sequence
-            #         start_idx = max(0, total_length - latent_window_size)
-            #     else:
-            #         # Calculate windows that distribute more evenly across the sequence
-            #         # This normalizes the padding values to create appropriate spacing
-            #         if max_padding > 0:  # Avoid division by zero
-            #             progress = (max_padding - latent_padding) / max_padding
-            #             start_idx = int(progress * max(0, total_length - latent_window_size))
-            #         else:
-            #             start_idx = 0
-
-            #     end_idx = min(start_idx + latent_window_size, total_length)
-            #     print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
-            #     input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
-
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
@@ -944,4 +923,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadFramePackModel": "Load FramePackModel",
     "FramePackLoraSelect": "Select Lora",
     }
-
