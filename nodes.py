@@ -725,7 +725,7 @@ class FramePackSamplerF1:
     )
     RETURN_NAMES = (
         "samples",
-        "samples_for_this_section",
+        "samples_for_this_node",
         "model",
         "positive",
         "negative",
@@ -803,6 +803,7 @@ class FramePackSamplerF1:
         print("history_latents", history_latents.shape)
         print("total_generated_latent_frames", total_generated_latent_frames)
         real_history_latents = None
+        generated_latents_for_this_node = None
 
         comfy_model = HyVideoModel(
                 HyVideoModelConfig(base_dtype),
@@ -881,6 +882,11 @@ class FramePackSamplerF1:
             # F1では末尾にgenerated_latentsを付け足す
             history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
 
+            if generated_latents_for_this_node is None:
+                generated_latents_for_this_node = generated_latents.to(history_latents)
+            else:
+                generated_latents_for_this_node = torch.cat([generated_latents_for_this_node, generated_latents.to(generated_latents_for_this_node)], dim=2)
+
             real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
 
             if is_last_section:
@@ -893,9 +899,13 @@ class FramePackSamplerF1:
             # If no latents were generated, return the original history latents
             real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
 
+        if generated_latents_for_this_node is None:
+            # If no latents were generated, return the original history latents
+            generated_latents_for_this_node = history_latents[:, :, -total_generated_latent_frames:, :, :]
+
         return (
             {"samples": real_history_latents / vae_scaling_factor},
-            {"samples": generated_latents / vae_scaling_factor}, # sample for this section
+            {"samples": generated_latents_for_this_node / vae_scaling_factor}, # sample for this section
             model,
             positive,
             negative,
