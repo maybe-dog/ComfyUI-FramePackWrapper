@@ -1125,6 +1125,9 @@ class FramePackSamplerF1Resample:
                     callback=callback,
                 )
 
+            # history_latentsをgenerated_latentsで置換
+            history_latents[:, :, start_i:end_i, :, :] = generated_latents.to(history_latents)
+
             total_generated_latent_frames += int(generated_latents.shape[2])
 
             real_history_latents = torch.cat([real_history_latents, generated_latents.to(real_history_latents)], dim=2)
