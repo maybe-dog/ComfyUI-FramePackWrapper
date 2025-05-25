@@ -918,10 +918,246 @@ class FramePackSamplerF1:
             # section_start_idx + num_sections,
         )
 
+# V2V用のノード
+class FramePackSamplerF1Resample:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("FramePackMODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "steps": ("INT", {"default": 30, "min": 1}),
+                "use_teacache": ("BOOLEAN", {"default": True, "tooltip": "Use teacache for faster sampling."}),
+                "teacache_rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The threshold for the relative L1 loss."}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.01}),
+                "guidance_scale": ("FLOAT", {"default": 10.0, "min": 0.0, "max": 32.0, "step": 0.01}),
+                "shift": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "latent_window_size": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1, "tooltip": "The size of the latent window to use for sampling."}),
+                "gpu_memory_preservation": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 128.0, "step": 0.1, "tooltip": "The amount of GPU memory to preserve."}),
+                "sampler": (["unipc_bh1", "unipc_bh2"],
+                    {
+                        "default": 'unipc_bh1'
+                    }),
+                # Resampleでは必ず動画のLatentが必要
+                "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
+            },
+            "optional": {
+                "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
+                "image_embeds": ("CLIP_VISION_OUTPUT", ),
+                # "end_latent": ("LATENT", {"tooltip": "end Latents to use for image2video"} ), # F1には使えない
+                # "end_image_embeds": ("CLIP_VISION_OUTPUT", {"tooltip": "end Image's clip embeds"} ), # F1には使えない
+                "embed_interpolation": (["disabled", "weighted_average", "linear"], {"default": 'disabled', "tooltip": "Image embedding interpolation type. If linear, will smoothly interpolate with time, else it'll be weighted average with the specified weight."}),
+                "start_embed_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Weighted average constant for image embed interpolation. If end image is not set, the embed's strength won't be affected"}),
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "t2v_width": ("INT", {"default": 640, "min": 8, "step": 8, "tooltip": "Text-to-video width."}),
+                "t2v_height": ("INT", {"default": 640, "min": 8, "step": 8, "tooltip": "Text-to-video height."}),
+                # F1ではセクションの開始位置を指定する必要はない
+                # "section_start_idx": ("INT", {"default": 0, "min": 0, "tooltip": "Start index of section"}),
+                # V2Vではhistory_latents不要
+                # "history_latents": ("LATENT", ),
+            }
+        }
+
+    RETURN_TYPES = (
+        "LATENT",
+        "FramePackMODEL",
+        "CONDITIONING",
+        "CONDITIONING",
+        "CLIP_VISION_OUTPUT",
+        "LATENT",
+        # "LATENT",
+        # "CLIP_VISION_OUTPUT",
+        # "LATENT",
+        # "FLOAT",
+        # "INT",
+    )
+    RETURN_NAMES = (
+        "samples",
+        "model",
+        "positive",
+        "negative",
+        "image_embeds",
+        "start_latent",
+        # "end_latent",
+        # "end_embeds",
+        # "history_latents",
+        # "total_second_length",
+        # "next_section_start_idx",
+    )
+    FUNCTION = "process"
+    CATEGORY = "FramePackWrapper"
+
+    def process(self, model, shift, positive, negative, latent_window_size, use_teacache, teacache_rel_l1_thresh, steps, cfg,
+                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0,
+                t2v_width=None, t2v_height=None):
+        transformer = model["transformer"]
+        base_dtype = model["dtype"]
+
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+
+        mm.unload_all_models()
+        mm.cleanup_models()
+        mm.soft_empty_cache()
+        
+        start_latent_samples = start_latent
+        if start_latent is not None:
+            start_latent = start_latent_samples["samples"] * vae_scaling_factor
+        else:
+            start_latent = torch.zeros([1, 16, 0, t2v_height // 8, t2v_width // 8])
+        
+        initial_samples = initial_samples["samples"] * vae_scaling_factor
+        print("start_latent", start_latent.shape if start_latent is not None else None)
+        B, C, T, H, W = start_latent.shape
+
+        image_encoder_last_hidden_state = None
+
+        if image_embeds is not None:
+            start_image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(device, base_dtype)
+            image_encoder_last_hidden_state = start_image_encoder_last_hidden_state # F1では開始画像の埋め込みを使う
+
+        llama_vec = positive[0][0].to(device, base_dtype)
+        clip_l_pooler = positive[0][1]["pooled_output"].to(device, base_dtype)
+
+        if not math.isclose(cfg, 1.0):
+            llama_vec_n = negative[0][0].to(device, base_dtype)
+            clip_l_pooler_n = negative[0][1]["pooled_output"].to(device, base_dtype)
+        else:
+            llama_vec_n = torch.zeros_like(llama_vec, device=device)
+            clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
+
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+
+        # 必要なセクション数を計算
+        num_sections = int(np.ceil(initial_samples.shape[2] / latent_window_size))
+
+        total_generated_latent_frames = 0
+        history_latents = torch.zeros(size=(1, 16, 16 + 2 + 1, H, W), dtype=torch.float32).cpu()
+        history_latents = torch.cat([history_latents, initial_samples.to(history_latents)], dim=2)
+
+        print("history_latents", history_latents.shape)
+        print("total_generated_latent_frames", total_generated_latent_frames)
+        real_history_latents = torch.zeros([1, 16, 0, start_latent.shape[3], start_latent.shape[4]], dtype=torch.float32).cpu()
+
+        comfy_model = HyVideoModel(
+                HyVideoModelConfig(base_dtype),
+                model_type=comfy.model_base.ModelType.FLOW,
+                device=device,
+            )
+
+        patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, torch.device("cpu"))
+        from latent_preview import prepare_callback
+        callback = prepare_callback(patcher, steps)
+
+        move_model_to_device_with_memory_preservation(transformer, target_device=device, preserved_memory_gb=gpu_memory_preservation)
+
+        
+        for i in range(num_sections):
+            # Reset rnd with the same seed for each section to keep outputs identical whether using a single sampler or multiple chained samplers.
+            rnd = torch.Generator("cpu").manual_seed(seed + i)
+
+            is_last_section = (i == num_sections - 1)
+
+            # resamplingするlatents
+            start_i = 16 + 2 + 1 + total_generated_latent_frames
+            num_frames = None
+            latent_window_size_for_this_section = latent_window_size
+
+            if not is_last_section:
+                end_i = start_i + latent_window_size
+                num_frames = latent_window_size * 4 - 3
+            else:
+                # 最後のセクションでは最後まで
+                end_i = history_latents.shape[2]
+                num_frames = (history_latents.shape[2] - start_i) * 4 - 3
+                latent_window_size_for_this_section = (end_i - start_i)
+            
+            print(f"Section {i + 1}/{num_sections}, start_i: {start_i}, end_i: {end_i}, num_frames: {num_frames}")
+            
+            initial_latent = history_latents[:, :, start_i:end_i, :, :]
+
+            # 以下はF1のフロー
+            indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size_for_this_section])).unsqueeze(0)
+            clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([1, 16, 2, 1, latent_window_size_for_this_section], dim=1)
+            clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
+            clean_latents_4x, clean_latents_2x, clean_latents_1x = history_latents[:, :, start_i - sum([16, 2, 1]):start_i, :, :].split([16, 2, 1], dim=2)
+            clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
+
+            if use_teacache:
+                transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
+            else:
+                transformer.initialize_teacache(enable_teacache=False)
+
+            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=base_dtype, enabled=True):
+                generated_latents = sample_hunyuan(
+                    transformer=transformer,
+                    sampler=sampler,
+                    strength=denoise_strength,
+                    initial_latent=initial_latent,
+                    width=W * 8,
+                    height=H * 8,
+                    frames=num_frames,
+                    real_guidance_scale=cfg,
+                    distilled_guidance_scale=guidance_scale,
+                    guidance_rescale=0,
+                    # shift=shift if shift != 0 else None, # F1ではコメントアウトされている
+                    num_inference_steps=steps,
+                    generator=rnd,
+                    prompt_embeds=llama_vec,
+                    prompt_embeds_mask=llama_attention_mask,
+                    prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n,
+                    negative_prompt_embeds_mask=llama_attention_mask_n,
+                    negative_prompt_poolers=clip_l_pooler_n,
+                    device=device,
+                    dtype=base_dtype,
+                    image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=clean_latents_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=clean_latents_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
+                    callback=callback,
+                )
+
+            total_generated_latent_frames += int(generated_latents.shape[2])
+
+            real_history_latents = torch.cat([real_history_latents, generated_latents.to(real_history_latents)], dim=2)
+
+            if is_last_section:
+                break
+
+        transformer.to(offload_device)
+        mm.soft_empty_cache()
+        
+        if real_history_latents is None:
+            # If no latents were generated, return the original history latents
+            real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
+
+        return (
+            {"samples": real_history_latents / vae_scaling_factor},
+            model,
+            positive,
+            negative,
+            image_embeds,
+            start_latent_samples,
+            # end_latent_samples,
+            # end_image_embeds,
+            {"samples": history_latents},
+            # total_second_length,
+            # section_start_idx + num_sections,
+        )
+
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
     "FramePackSampler": FramePackSampler,
     "FramePackSamplerF1": FramePackSamplerF1,
+    "FramePackSamplerF1Resample": FramePackSamplerF1Resample,
     "FramePackTorchCompileSettings": FramePackTorchCompileSettings,
     "FramePackFindNearestBucket": FramePackFindNearestBucket,
     "LoadFramePackModel": LoadFramePackModel,
@@ -931,6 +1167,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadFramePackModel": "(Down)Load FramePackModel",
     "FramePackSampler": "FramePackSampler",
     "FramePackSamplerF1": "FramePackSamplerF1", 
+    "FramePackSamplerF1Resample": "FramePackSamplerF1Resample",
     "FramePackTorchCompileSettings": "Torch Compile Settings",
     "FramePackFindNearestBucket": "Find Nearest Bucket",
     "LoadFramePackModel": "Load FramePackModel",
